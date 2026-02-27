@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -119,9 +120,10 @@ def _get_tutor_input_via_editor(student_context: str) -> str | None:
 # Fixed prompt sent to tutor after student says task_complete
 TUTOR_POST_COMPLETE_PROMPT = (
     "The student has indicated they are done with this session. "
-    "Based on this conversation, please create a practice problem that reinforces what was covered. "
-    "Give only the problem statement (no solution)."
+    "Based on this conversation, please create 5 practice problems that reinforce what was covered. "
+    "Give only problem statements (no solutions)."
 )
+PRACTICE_QUESTION_COUNT = 5
 
 
 def _build_sim_workspace(profile_id: str | None, entry_id: str, shared_by_profile: bool) -> str:
@@ -284,6 +286,318 @@ async def deep_tutor_generate_practice_problem(
     return _format_question_block(questions[0])
 
 
+async def deep_tutor_generate_practice_questions(
+    *,
+    kb_name: str,
+    workspace: str,
+    topic: str,
+    language: str = "en",
+    num_questions: int = PRACTICE_QUESTION_COUNT,
+) -> list[str]:
+    """Generate multiple practice questions via DeepTutor question pipeline."""
+    from benchmark.simulation.tools import generate_questions
+
+    if not kb_name:
+        return ["(Practice question generation unavailable: missing kb_name in entry.)"]
+
+    result = await generate_questions(
+        workspace=workspace,
+        kb_name=kb_name,
+        topic=topic,
+        num_questions=num_questions,
+        language=language,
+    )
+    questions = result.get("questions", []) or []
+    formatted = [_format_question_block(q) for q in questions if q]
+    return formatted or ["(Practice question generation failed.)"]
+
+
+def _format_practice_questions_block(questions: list[str]) -> str:
+    """Render practice questions as numbered block."""
+    lines: list[str] = []
+    for i, q in enumerate(questions, start=1):
+        lines.append(f"Q{i}. {q.strip()}")
+    return "\n\n".join(lines) if lines else "(No practice questions generated.)"
+
+
+def _split_questions_from_text(text: str) -> list[str]:
+    """Best-effort split of question list from raw text."""
+    if not text.strip():
+        return []
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+    # Prefer lines/blocks that look like numbered questions.
+    numbered = [b for b in blocks if re.match(r"^(Q?\d+[\).:]\s+)", b, flags=re.I)]
+    if numbered:
+        return numbered[:PRACTICE_QUESTION_COUNT]
+    return blocks[:PRACTICE_QUESTION_COUNT]
+
+
+def _normalize_question_text(text: str) -> str:
+    """Normalize question text for duplicate checks."""
+    s = text.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"^[qQ]?\d+[\).:]\s*", "", s)
+    return s
+
+
+async def mock_tutor_generate_practice_questions(
+    *,
+    tutor_history: list[dict[str, str]],
+    kb_name: str | None,
+    prior_sessions_summary: str | None,
+    num_questions: int = PRACTICE_QUESTION_COUNT,
+) -> list[str]:
+    """
+    Generate practice questions via mock tutor in 5 iterative rounds.
+    Each round includes all previously generated questions as context.
+    """
+    generated: list[str] = []
+    generated_norm: set[str] = set()
+    practice_history = list(tutor_history)
+
+    for i in range(1, num_questions + 1):
+        prev = "\n".join([f"{idx + 1}. {q}" for idx, q in enumerate(generated)]) or "(none yet)"
+        prompt = (
+            "The student has finished this session. Generate EXACTLY ONE new practice question.\n"
+            f"This is question {i} of {num_questions}.\n\n"
+            "Requirements:\n"
+            "- Keep it aligned with this session's covered concepts.\n"
+            "- Avoid overlap with previously generated questions.\n"
+            "- Output only the question statement, no solution.\n\n"
+            f"Previously generated questions:\n{prev}"
+        )
+
+        chosen = None
+        # Retry a few times if model repeats a previous question.
+        for _ in range(3):
+            candidate = await mock_tutor_respond(
+                prompt,
+                practice_history,
+                kb_name=kb_name,
+                prior_sessions_summary=prior_sessions_summary,
+            )
+            candidate = (candidate or "").strip()
+            norm = _normalize_question_text(candidate)
+            if candidate and norm and norm not in generated_norm:
+                chosen = candidate
+                generated_norm.add(norm)
+                break
+            prompt = (
+                "Your previous output overlapped with an existing question.\n"
+                "Generate ONE different question only, substantially different in setup/target.\n\n"
+                f"Existing questions:\n{prev}"
+            )
+
+        if not chosen:
+            chosen = "(Failed to generate a unique practice question.)"
+
+        generated.append(chosen)
+        practice_history.append({"role": "user", "content": prompt})
+        practice_history.append({"role": "assistant", "content": chosen})
+
+    return generated
+
+
+async def _evaluate_practice_questions(
+    *,
+    questions: list[str],
+    gaps: list[dict],
+    profile: dict,
+) -> dict:
+    """
+    Evaluate generated practice questions with two independent metrics:
+    1) Gap coverage score (1-5) on the full 5-question set, averaged across gaps
+    2) Difficulty fit delta (-5 too easy ... +5 too hard; 0 ideal), report average abs
+    """
+    from benchmark.data_generation.llm_utils import extract_json
+    from src.services.llm import factory
+
+    if not questions:
+        return {
+            "per_question": [],
+            "summary": {
+                "avg_gap_coverage": None,
+                "avg_difficulty_abs": None,
+                "num_questions": 0,
+            },
+        }
+
+    gap_view = [
+        {
+            "gap_id": g.get("gap_id", ""),
+            "type": g.get("type", ""),
+            "target_concept": g.get("target_concept", ""),
+            "description": g.get("description", ""),
+            "correct_understanding": g.get("correct_understanding", ""),
+        }
+        for g in gaps
+    ]
+    profile_view = {
+        "profile_id": profile.get("profile_id", ""),
+        "learning_purpose": profile.get("learning_purpose", ""),
+        "knowledge_state": profile.get("knowledge_state", {}),
+    }
+
+    # Metric 1: evaluate gap coverage using all generated questions at once.
+    questions_block = "\n\n".join([f"Q{i}. {q}" for i, q in enumerate(questions, start=1)])
+    coverage_prompt = (
+        "Evaluate the following PRACTICE QUESTION SET as a whole.\n\n"
+        f"Question set:\n{questions_block}\n\n"
+        f"Knowledge gaps:\n{json.dumps(gap_view, ensure_ascii=False, indent=2)}\n\n"
+        "Return strict JSON only:\n"
+        "{\n"
+        '  "gap_scores": {"gap_id": 1-5, "...": 1-5},\n'
+        '  "rationale": "short reason"\n'
+        "}\n\n"
+        "Scoring guide:\n"
+        "- For EACH gap, score how well the FULL question set covers that gap.\n"
+        "- 1 means almost no coverage; 5 means strong and explicit coverage.\n"
+    )
+    coverage_system = (
+        "You are a strict education evaluator. Output valid JSON only, no markdown."
+    )
+    try:
+        coverage_raw = await factory.complete(
+            prompt=coverage_prompt,
+            system_prompt=coverage_system,
+            temperature=0.0,
+            max_tokens=1000,
+        )
+        coverage_parsed = extract_json(coverage_raw)
+    except Exception as e:
+        logger.warning("Practice set gap-coverage eval failed: %s", e)
+        coverage_parsed = {
+            "gap_scores": {g.get("gap_id", f"gap_{idx+1}"): 1 for idx, g in enumerate(gap_view)},
+            "rationale": "fallback score due to parse/eval failure",
+        }
+
+    set_gap_scores: dict[str, int] = {}
+    for g in gap_view:
+        gid = g.get("gap_id", "")
+        raw_score = (coverage_parsed.get("gap_scores") or {}).get(gid, 1)
+        try:
+            s = int(raw_score)
+        except Exception:
+            s = 1
+        set_gap_scores[gid] = max(1, min(5, s))
+
+    set_gap_avg = (
+        (sum(set_gap_scores.values()) / len(set_gap_scores)) if set_gap_scores else None
+    )
+
+    # Metric 2: keep per-question difficulty fit evaluation.
+    per_question: list[dict] = []
+    for i, q in enumerate(questions, start=1):
+        user_prompt = (
+            "Evaluate one practice question for tutoring quality.\n\n"
+            f"Question #{i}:\n{q}\n\n"
+            f"Student profile:\n{json.dumps(profile_view, ensure_ascii=False, indent=2)}\n\n"
+            "Return strict JSON only:\n"
+            "{\n"
+            '  "difficulty_fit_delta": -5_to_5,\n'
+            '  "rationale": "short reason"\n'
+            "}\n\n"
+            "Scoring guide:\n"
+            "- difficulty_fit_delta: -5 much too easy, +5 much too hard, 0 best fit.\n"
+        )
+        system_prompt = (
+            "You are a strict education evaluator. "
+            "Output valid JSON only, no markdown. "
+            "Use evidence from question text, profile level, and gap definitions."
+        )
+        try:
+            raw = await factory.complete(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                temperature=0.0,
+                max_tokens=800,
+            )
+            parsed = extract_json(raw)
+        except Exception as e:
+            logger.warning("Practice question eval failed on Q%s: %s", i, e)
+            parsed = {
+                "difficulty_fit_delta": 0,
+                "rationale": "fallback score due to parse/eval failure",
+            }
+
+        try:
+            diff_delta = int(parsed.get("difficulty_fit_delta", 0))
+        except Exception:
+            diff_delta = 0
+        diff_delta = max(-5, min(5, diff_delta))
+
+        per_question.append(
+            {
+                "question_index": i,
+                "question": q,
+                "difficulty_fit_delta": diff_delta,
+                "difficulty_abs": abs(diff_delta),
+                "rationale": parsed.get("rationale", ""),
+            }
+        )
+
+    diff_abs_values = [x["difficulty_abs"] for x in per_question]
+    return {
+        "per_question": per_question,
+        "gap_coverage": {
+            "gap_scores": set_gap_scores,
+            "avg_across_gaps": set_gap_avg,
+            "rationale": coverage_parsed.get("rationale", ""),
+        },
+        "summary": {
+            "avg_gap_coverage": set_gap_avg,
+            "avg_difficulty_abs": (sum(diff_abs_values) / len(diff_abs_values))
+            if diff_abs_values
+            else None,
+            "num_questions": len(per_question),
+        },
+    }
+
+
+def _print_practice_eval(session_label: str, metrics: dict) -> None:
+    """Print concise metric summary for one session/profile."""
+    summary = metrics.get("summary", {})
+    cov = summary.get("avg_gap_coverage")
+    diff = summary.get("avg_difficulty_abs")
+    n = summary.get("num_questions", 0)
+    cov_txt = f"{cov:.2f}" if isinstance(cov, (int, float)) else "N/A"
+    diff_txt = f"{diff:.2f}" if isinstance(diff, (int, float)) else "N/A"
+    print(
+        f"[PracticeEval] {session_label} | questions={n} | "
+        f"avg_gap_coverage={cov_txt} | avg_abs_difficulty_delta={diff_txt}"
+    )
+
+
+def _aggregate_profile_practice_eval(sessions_results: list[dict]) -> dict:
+    """Aggregate practice metrics across all sessions in a profile run."""
+    cov_values: list[float] = []
+    diff_values: list[float] = []
+    q_count = 0
+
+    for r in sessions_results:
+        pe = r.get("practice_eval") or {}
+        summary = pe.get("summary") or {}
+        cov = summary.get("avg_gap_coverage")
+        diff = summary.get("avg_difficulty_abs")
+        n = summary.get("num_questions") or 0
+        if isinstance(cov, (int, float)):
+            cov_values.append(float(cov))
+        if isinstance(diff, (int, float)):
+            diff_values.append(float(diff))
+        q_count += int(n)
+
+    return {
+        "avg_gap_coverage_across_sessions": (sum(cov_values) / len(cov_values))
+        if cov_values
+        else None,
+        "avg_abs_difficulty_delta_across_sessions": (sum(diff_values) / len(diff_values))
+        if diff_values
+        else None,
+        "total_questions": q_count,
+        "num_sessions": len(sessions_results),
+    }
+
+
 def _summarize_session(transcript: list[dict], task: dict, session_index: int) -> str:
     """Produce a brief summary of a session for prior_sessions context."""
     title = task.get("title", "Unknown task")
@@ -384,35 +698,35 @@ async def _run_single_session(
         student_msg, student_action = await agent.respond(tutor_msg)
         print(f"[Student] {student_msg}\n")
         if student_action == "task_complete":
-            print("[System] Student indicated task complete. Requesting practice problem from tutor...")
+            print("[System] Student indicated task complete. Requesting practice questions from tutor...")
             tutor_history.append({"role": "user", "content": student_msg})
+            practice_questions: list[str] = []
             if auto:
                 try:
                     if auto_backend == "deep_tutor":
                         topic = (
                             f"{task_title}\n"
                             f"Conversation summary request: {TUTOR_POST_COMPLETE_PROMPT}\n"
-                            "Generate one practice problem aligned to this session."
+                            f"Generate {PRACTICE_QUESTION_COUNT} practice questions aligned to this session."
                         )
-                        practice_msg = await deep_tutor_generate_practice_problem(
+                        practice_questions = await deep_tutor_generate_practice_questions(
                             kb_name=kb_name,
                             workspace=workspace,
                             topic=topic,
                             language=deeptutor_language,
                         )
                     else:
-                        practice_msg = await mock_tutor_respond(
-                            TUTOR_POST_COMPLETE_PROMPT,
-                            tutor_history,
+                        practice_questions = await mock_tutor_generate_practice_questions(
+                            tutor_history=tutor_history,
                             kb_name=kb_name,
                             prior_sessions_summary=prior_sessions_summary,
                         )
                 except Exception as e:
                     logger.error("Auto tutor post-complete failed (%s): %s", auto_backend, e)
-                    practice_msg = "(Practice problem generation failed.)"
+                    practice_questions = ["(Practice question generation failed.)"]
             else:
                 print(f"[Tutor] {TUTOR_POST_COMPLETE_PROMPT}")
-                print("[Tutor] (type practice problem, empty line + Enter to send)")
+                print("[Tutor] (type 5 practice questions, separate by blank lines, empty line + Enter to send)")
                 lines = []
                 while True:
                     try:
@@ -422,11 +736,24 @@ async def _run_single_session(
                     if line == "" and lines:
                         break
                     lines.append(line)
-                practice_msg = "\n".join(lines) if lines else "(No practice problem provided.)"
+                practice_questions = _split_questions_from_text("\n".join(lines))
+                if not practice_questions:
+                    practice_questions = ["(No practice questions provided.)"]
+
+            if len(practice_questions) > PRACTICE_QUESTION_COUNT:
+                practice_questions = practice_questions[:PRACTICE_QUESTION_COUNT]
+            practice_msg = _format_practice_questions_block(practice_questions)
             tutor_history.append({"role": "assistant", "content": practice_msg})
             print(f"[Tutor] {practice_msg}\n")
             # Append to agent history so it appears in transcript
             agent.history.append({"role": "user", "content": practice_msg})
+
+            practice_eval = await _evaluate_practice_questions(
+                questions=practice_questions,
+                gaps=entry.get("gaps", []),
+                profile=entry.get("profile", {}),
+            )
+            _print_practice_eval(entry_id, practice_eval)
             break
 
     transcript = agent.get_transcript()
@@ -435,6 +762,8 @@ async def _run_single_session(
         "transcript": transcript,
         "entry": entry,
         "actual_turns": agent.turn_count,
+        "practice_questions": practice_questions if "practice_questions" in locals() else [],
+        "practice_eval": practice_eval if "practice_eval" in locals() else None,
     }
 
 
@@ -562,34 +891,35 @@ async def run_conversation(
         student_msg, student_action = await agent.respond(tutor_msg)
         print(f"[Student] {student_msg}\n")
         if student_action == "task_complete":
-            print("[System] Student indicated task complete. Requesting practice problem from tutor...")
+            print("[System] Student indicated task complete. Requesting practice questions from tutor...")
             tutor_history.append({"role": "user", "content": student_msg})
+            practice_questions: list[str] = []
             if auto:
                 try:
                     if auto_backend == "deep_tutor":
                         topic = (
                             f"{task_title}\n"
                             f"Conversation summary request: {TUTOR_POST_COMPLETE_PROMPT}\n"
-                            "Generate one practice problem aligned to this session."
+                            f"Generate {PRACTICE_QUESTION_COUNT} practice questions aligned to this session."
                         )
-                        practice_msg = await deep_tutor_generate_practice_problem(
+                        practice_questions = await deep_tutor_generate_practice_questions(
                             kb_name=kb_name,
                             workspace=workspace,
                             topic=topic,
                             language=deeptutor_language,
                         )
                     else:
-                        practice_msg = await mock_tutor_respond(
-                            TUTOR_POST_COMPLETE_PROMPT,
-                            tutor_history,
+                        practice_questions = await mock_tutor_generate_practice_questions(
+                            tutor_history=tutor_history,
                             kb_name=kb_name,
+                            prior_sessions_summary=None,
                         )
                 except Exception as e:
                     logger.error("Auto tutor post-complete failed (%s): %s", auto_backend, e)
-                    practice_msg = "(Practice problem generation failed.)"
+                    practice_questions = ["(Practice question generation failed.)"]
             else:
                 print(f"[Tutor] {TUTOR_POST_COMPLETE_PROMPT}")
-                print("[Tutor] (type practice problem, empty line + Enter to send)")
+                print("[Tutor] (type 5 practice questions, separate by blank lines, empty line + Enter to send)")
                 lines = []
                 while True:
                     try:
@@ -599,9 +929,21 @@ async def run_conversation(
                     if line == "" and lines:
                         break
                     lines.append(line)
-                practice_msg = "\n".join(lines) if lines else "(No practice problem provided.)"
+                practice_questions = _split_questions_from_text("\n".join(lines))
+                if not practice_questions:
+                    practice_questions = ["(No practice questions provided.)"]
+
+            if len(practice_questions) > PRACTICE_QUESTION_COUNT:
+                practice_questions = practice_questions[:PRACTICE_QUESTION_COUNT]
+            practice_msg = _format_practice_questions_block(practice_questions)
             print(f"[Tutor] {practice_msg}\n")
             agent.history.append({"role": "user", "content": practice_msg})
+            practice_eval = await _evaluate_practice_questions(
+                questions=practice_questions,
+                gaps=entry.get("gaps", []),
+                profile=entry.get("profile", {}),
+            )
+            _print_practice_eval(entry_id, practice_eval)
             break
 
     print(f"{'='*60}")
@@ -617,6 +959,8 @@ async def run_conversation(
         "actual_turns": agent.turn_count,
         "transcript": agent.get_transcript(),
         "entry": entry,
+        "practice_questions": practice_questions if "practice_questions" in locals() else [],
+        "practice_eval": practice_eval if "practice_eval" in locals() else None,
     }
 
     # Save transcript
@@ -764,20 +1108,38 @@ async def run_multi_session(
 
         sessions_results.append(result)
         print(f"\n[Session {session_num} complete. {result['actual_turns']} turns.]")
+        if result.get("practice_eval"):
+            _print_practice_eval(f"session_{session_num}", result["practice_eval"])
 
     # Save combined result
+    profile_practice_eval = _aggregate_profile_practice_eval(sessions_results)
+    _print_practice_eval(
+        "profile_overall",
+        {
+            "summary": {
+                "avg_gap_coverage": profile_practice_eval.get("avg_gap_coverage_across_sessions"),
+                "avg_difficulty_abs": profile_practice_eval.get(
+                    "avg_abs_difficulty_delta_across_sessions"
+                ),
+                "num_questions": profile_practice_eval.get("total_questions", 0),
+            }
+        },
+    )
     combined = {
         "profile_id": profile_id_display,
         "timestamp": datetime.now().isoformat(),
         "mode": "auto" if auto else "interactive",
         "evolve_profile": evolve_profile,
         "num_sessions": len(sessions_results),
+        "practice_eval_profile": profile_practice_eval,
         "sessions": [
             {
                 "entry_id": r["entry_id"],
                 "actual_turns": r["actual_turns"],
                 "transcript": r["transcript"],
                 "entry": r["entry"],
+                "practice_questions": r.get("practice_questions", []),
+                "practice_eval": r.get("practice_eval"),
             }
             for r in sessions_results
         ],
