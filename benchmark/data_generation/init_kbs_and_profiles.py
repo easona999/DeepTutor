@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import sys
+from subprocess import DEVNULL
 from datetime import datetime
 from pathlib import Path
 
@@ -45,6 +46,31 @@ MAX_CONCURRENCY = 5
 
 class PipelineAbortError(RuntimeError):
     """Abort all processing when any single PDF pipeline fails."""
+
+
+def _runtime_status(message: str) -> None:
+    """Print concise runtime scheduler status."""
+    print(message, flush=True)
+
+
+def _configure_quiet_logging() -> None:
+    """Suppress noisy INFO logs from app and dependencies."""
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
+    noisy = [
+        "src",
+        "benchmark",
+        "httpx",
+        "httpcore",
+        "openai",
+        "lightrag",
+        "nano-vectordb",
+        "asyncio",
+    ]
+    for name in noisy:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def _sanitize_kb_name(name: str) -> str:
@@ -163,7 +189,38 @@ async def _process_pdf(
     return out
 
 
-async def _run_single_pdf_child(
+async def _run_gpu_stage_only(
+    *,
+    pdf_path: Path,
+    kb_name: str,
+    kb_base_dir: Path,
+    use_mineru_api: bool,
+    mineru_api_token: str | None,
+    mineru_model_version: str,
+) -> None:
+    """Run only GPU-heavy stage: create/copy/process documents."""
+    try:
+        logger.info("=" * 70)
+        logger.info("GPU stage start | PDF: %s | KB: %s", pdf_path.name, kb_name)
+        logger.info("=" * 70)
+        initializer = KnowledgeBaseInitializer(kb_name=kb_name, base_dir=str(kb_base_dir))
+        initializer.create_directory_structure()
+        copied = initializer.copy_documents([str(pdf_path)])
+        if not copied:
+            raise RuntimeError(f"Failed to copy PDF: {pdf_path}")
+        await initializer.process_documents(
+            use_mineru_api=use_mineru_api,
+            mineru_api_token=mineru_api_token,
+            mineru_model_version=mineru_model_version,
+        )
+    except Exception as e:
+        logger.exception("Failed on %s -> %s: %s", pdf_path.name, kb_name, e)
+        raise PipelineAbortError(
+            f"GPU stage failed for {pdf_path.name} (kb={kb_name}). Program terminated."
+        ) from e
+
+
+async def _run_post_gpu_stage(
     *,
     pdf_path: Path,
     kb_name: str,
@@ -172,59 +229,69 @@ async def _run_single_pdf_child(
     rag_cfg: dict,
     output_dir: Path,
     skip_extract: bool,
-    use_mineru_api: bool,
-    mineru_api_token: str | None,
-    mineru_model_version: str,
-) -> None:
-    """Run one PDF pipeline in child process; cleanup and fail on error."""
-    try:
-        await _process_pdf(
-            pdf_path=pdf_path,
-            kb_name=kb_name,
-            kb_base_dir=kb_base_dir,
-            profile_cfg=profile_cfg,
-            rag_cfg=rag_cfg,
-            output_dir=output_dir,
-            skip_extract=skip_extract,
-            use_mineru_api=use_mineru_api,
-            mineru_api_token=mineru_api_token,
-            mineru_model_version=mineru_model_version,
-        )
-    except Exception as e:
-        logger.exception("Failed on %s -> %s: %s", pdf_path.name, kb_name, e)
-        _cleanup_failed_kb_data(kb_base_dir=kb_base_dir, kb_name=kb_name, output_dir=output_dir)
-        raise PipelineAbortError(
-            f"Pipeline failed for {pdf_path.name} (kb={kb_name}). Program terminated."
-        ) from e
+) -> dict:
+    """Run non-GPU stage after documents are processed."""
+    initializer = KnowledgeBaseInitializer(kb_name=kb_name, base_dir=str(kb_base_dir))
+    if not skip_extract:
+        initializer.extract_numbered_items()
+
+    scope = await generate_knowledge_scope(
+        kb_name=kb_name,
+        seed_queries=rag_cfg.get("seed_queries"),
+        mode=rag_cfg.get("mode", "naive"),
+        kb_base_dir=str(kb_base_dir),
+    )
+    profiles = await generate_profiles_for_kb(
+        knowledge_scope=scope,
+        background_types=profile_cfg.get(
+            "background_types", ["beginner", "intermediate", "advanced"]
+        ),
+        profiles_per_kb=profile_cfg.get("profiles_per_subtopic", 3),
+    )
+
+    out = {
+        "pdf_file": str(pdf_path),
+        "kb_name": kb_name,
+        "knowledge_scope": scope,
+        "profiles": profiles,
+        "num_profiles": len(profiles),
+    }
+    out_path = output_dir / f"{kb_name}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    logger.info("Saved: %s", out_path)
+    return out
 
 
-async def _run_jobs_with_gpu_sharding(
+async def _run_jobs_with_gpu_pipeline(
     *,
     jobs: list[tuple[Path, str]],
     gpu_ids: list[str],
     config_path: Path,
+    kb_base_dir: Path,
+    profile_cfg: dict,
+    rag_cfg: dict,
     output_dir: Path,
     skip_extract: bool,
     use_mineru_api: bool,
     mineru_api_token: str | None,
     mineru_model_version: str,
 ) -> list[dict]:
-    """Run jobs as child processes pinned to GPUs with fail-fast behavior."""
+    """Run jobs with GPU-stage sharding and immediate refill."""
     available_gpus = list(gpu_ids)
     running: list[dict] = []
     waiting_jobs = list(jobs)
     results: list[dict] = []
+    post_tasks: set[asyncio.Task] = set()
 
     async def _start_one(pdf_path: Path, kb_name: str, gpu_id: str) -> dict:
         cmd = [
             sys.executable,
             str(Path(__file__).resolve()),
-            "--single-pdf",
+            "--single-gpu-stage",
             str(pdf_path),
             "--single-kb-name",
             kb_name,
-            "--single-output-dir",
-            str(output_dir),
             "--config",
             str(config_path),
             "--mineru-model-version",
@@ -243,8 +310,13 @@ async def _run_jobs_with_gpu_sharding(
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu_id
-        logger.info("Spawn %s on GPU %s", kb_name, gpu_id)
-        proc = await asyncio.create_subprocess_exec(*cmd, env=env)
+        remaining_after_dispatch = len(waiting_jobs)
+        _runtime_status(
+            f"[GPU {gpu_id}] running {pdf_path.name} | queue remaining: {remaining_after_dispatch}"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, env=env, stdout=DEVNULL, stderr=DEVNULL
+        )
         wait_task = asyncio.create_task(proc.wait())
         return {
             "pdf_path": pdf_path,
@@ -260,13 +332,13 @@ async def _run_jobs_with_gpu_sharding(
             gpu_id = available_gpus.pop(0)
             running.append(await _start_one(pdf_path, kb_name, gpu_id))
 
-        if not running:
+        if not running and not post_tasks:
             break
 
-        done, _ = await asyncio.wait(
-            [r["wait_task"] for r in running],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        wait_targets = [r["wait_task"] for r in running] + list(post_tasks)
+        if not wait_targets:
+            break
+        done, _ = await asyncio.wait(wait_targets, return_when=asyncio.FIRST_COMPLETED)
 
         finished_entries = [r for r in running if r["wait_task"] in done]
         for entry in finished_entries:
@@ -285,14 +357,43 @@ async def _run_jobs_with_gpu_sharding(
                 for other in running:
                     other["proc"].terminate()
                 await asyncio.gather(*[r["wait_task"] for r in running], return_exceptions=True)
+                for task in post_tasks:
+                    task.cancel()
+                await asyncio.gather(*post_tasks, return_exceptions=True)
+                _cleanup_failed_kb_data(
+                    kb_base_dir=kb_base_dir, kb_name=entry["kb_name"], output_dir=output_dir
+                )
                 raise PipelineAbortError(
                     f"Pipeline failed for {entry['pdf_path'].name} (kb={entry['kb_name']})."
                 )
 
-            output_json = output_dir / f"{entry['kb_name']}.json"
-            if output_json.exists():
-                with open(output_json, encoding="utf-8") as f:
-                    results.append(json.load(f))
+            # GPU stage done -> immediately schedule non-GPU stage.
+            post_task = asyncio.create_task(
+                _run_post_gpu_stage(
+                    pdf_path=entry["pdf_path"],
+                    kb_name=entry["kb_name"],
+                    kb_base_dir=kb_base_dir,
+                    profile_cfg=profile_cfg,
+                    rag_cfg=rag_cfg,
+                    output_dir=output_dir,
+                    skip_extract=skip_extract,
+                )
+            )
+            post_tasks.add(post_task)
+
+        finished_post = [t for t in post_tasks if t in done]
+        for task in finished_post:
+            post_tasks.remove(task)
+            exc = task.exception()
+            if exc is not None:
+                for other in running:
+                    other["proc"].terminate()
+                await asyncio.gather(*[r["wait_task"] for r in running], return_exceptions=True)
+                for t in post_tasks:
+                    t.cancel()
+                await asyncio.gather(*post_tasks, return_exceptions=True)
+                raise PipelineAbortError(str(exc))
+            results.append(task.result())
 
     return results
 
@@ -343,15 +444,11 @@ async def main() -> None:
         default="0,1,2,3",
         help='GPU ids for sharding workloads, comma-separated (default: "0,1,2,3").',
     )
-    parser.add_argument("--single-pdf", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--single-gpu-stage", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--single-kb-name", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--single-output-dir", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    )
+    _configure_quiet_logging()
 
     cfg_path = Path(args.config)
     if not cfg_path.is_absolute():
@@ -367,20 +464,14 @@ async def main() -> None:
     profile_cfg = cfg.get("profile_generation", {})
     rag_cfg = cfg.get("rag_query", {})
 
-    if args.single_pdf:
-        if not args.single_kb_name or not args.single_output_dir:
-            raise ValueError("--single-pdf mode requires --single-kb-name and --single-output-dir")
-        pdf_path = Path(args.single_pdf).resolve()
-        output_dir = Path(args.single_output_dir).resolve()
-        output_dir.mkdir(parents=True, exist_ok=True)
-        await _run_single_pdf_child(
+    if args.single_gpu_stage:
+        if not args.single_kb_name:
+            raise ValueError("--single-gpu-stage mode requires --single-kb-name")
+        pdf_path = Path(args.single_gpu_stage).resolve()
+        await _run_gpu_stage_only(
             pdf_path=pdf_path,
             kb_name=args.single_kb_name,
             kb_base_dir=kb_base_dir,
-            profile_cfg=profile_cfg,
-            rag_cfg=rag_cfg,
-            output_dir=output_dir,
-            skip_extract=args.skip_extract,
             use_mineru_api=args.use_mineru_api,
             mineru_api_token=args.mineru_api_token,
             mineru_model_version=args.mineru_model_version,
@@ -410,17 +501,18 @@ async def main() -> None:
         jobs.append((pdf, kb_name))
 
     gpu_ids = _parse_gpu_ids(args.gpu_ids)
-    logger.info("Starting pipelines with max concurrency = %d", min(MAX_CONCURRENCY, len(gpu_ids)))
-    logger.info("GPU sharding enabled on ids: %s", ",".join(gpu_ids))
-    logger.info(
-        "Parser mode: %s",
-        "MinerU cloud API" if args.use_mineru_api else "local parser",
+    _runtime_status(
+        f"Start GPU scheduler | gpus={','.join(gpu_ids[:MAX_CONCURRENCY])} | "
+        f"mode={'mineru_api' if args.use_mineru_api else 'local'} | total_pdfs={len(jobs)}"
     )
     try:
-        results = await _run_jobs_with_gpu_sharding(
+        results = await _run_jobs_with_gpu_pipeline(
             jobs=jobs,
             gpu_ids=gpu_ids[:MAX_CONCURRENCY],
             config_path=cfg_path,
+            kb_base_dir=kb_base_dir,
+            profile_cfg=profile_cfg,
+            rag_cfg=rag_cfg,
             output_dir=output_dir,
             skip_extract=args.skip_extract,
             use_mineru_api=args.use_mineru_api,
