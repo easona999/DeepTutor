@@ -359,40 +359,52 @@ class DataGenerationPipeline:
         logger.info(f"Completed KB '{kb_name}': {len(profiles)} profiles, {kb_entries} entries")
 
     async def _stage_output(self, timestamp: str):
-        """Stage 6: Save final output — one pretty-printed JSON per entry."""
+        """Stage 6: Save final output — organized by KB, each with its own _all_entries.jsonl."""
         logger.info("[Stage 6] Saving benchmark dataset...")
 
-        # Create entries directory for this run
-        entries_dir = self.output_dir / f"benchmark_{timestamp}"
-        entries_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = self.output_dir / f"benchmark_{timestamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save each entry as a separate, human-readable JSON file.
-        # Guard against duplicated entry_id to avoid silent overwrite.
-        seen_entry_ids: dict[str, int] = {}
+        # Group entries by KB
+        entries_by_kb: dict[str, list[dict]] = {}
         for entry in self.benchmark_entries:
-            base_entry_id = str(entry.get("entry_id", "unknown"))
-            dup_count = seen_entry_ids.get(base_entry_id, 0)
-            seen_entry_ids[base_entry_id] = dup_count + 1
+            kb = entry.get("kb_name", "unknown")
+            entries_by_kb.setdefault(kb, []).append(entry)
 
-            if dup_count == 0:
-                entry_id = base_entry_id
-            else:
-                entry_id = f"{base_entry_id}__dup{dup_count + 1:02d}"
-                logger.warning(
-                    "Duplicate entry_id detected: %s -> renamed to %s",
-                    base_entry_id,
-                    entry_id,
-                )
-                entry["entry_id"] = entry_id
+        # Write per-KB directories
+        for kb_name, kb_entries in entries_by_kb.items():
+            kb_dir = run_dir / kb_name
+            kb_dir.mkdir(parents=True, exist_ok=True)
 
-            entry_file = entries_dir / f"{entry_id}.json"
-            with open(entry_file, "w", encoding="utf-8") as f:
-                json.dump(entry, f, ensure_ascii=False, indent=2)
+            seen_entry_ids: dict[str, int] = {}
+            for entry in kb_entries:
+                base_entry_id = str(entry.get("entry_id", "unknown"))
+                dup_count = seen_entry_ids.get(base_entry_id, 0)
+                seen_entry_ids[base_entry_id] = dup_count + 1
 
-        logger.info(f"Saved {len(self.benchmark_entries)} entries → {entries_dir}/")
+                if dup_count == 0:
+                    entry_id = base_entry_id
+                else:
+                    entry_id = f"{base_entry_id}__dup{dup_count + 1:02d}"
+                    logger.warning(
+                        "Duplicate entry_id detected: %s -> renamed to %s",
+                        base_entry_id, entry_id,
+                    )
+                    entry["entry_id"] = entry_id
 
-        # Also save a combined JSONL for programmatic use
-        combined_file = entries_dir / "_all_entries.jsonl"
+                entry_file = kb_dir / f"{entry_id}.json"
+                with open(entry_file, "w", encoding="utf-8") as f:
+                    json.dump(entry, f, ensure_ascii=False, indent=2)
+
+            kb_jsonl = kb_dir / "_all_entries.jsonl"
+            with open(kb_jsonl, "w", encoding="utf-8") as f:
+                for entry in kb_entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            logger.info(f"  {kb_name}: {len(kb_entries)} entries → {kb_dir}/")
+
+        # Also write a combined JSONL at the run level
+        combined_file = run_dir / "_all_entries.jsonl"
         with open(combined_file, "w", encoding="utf-8") as f:
             for entry in self.benchmark_entries:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -409,18 +421,16 @@ class DataGenerationPipeline:
                     {
                         "kb_name": kb,
                         "num_profiles": len(self.profiles.get(kb, [])),
-                        "num_entries": sum(
-                            1 for e in self.benchmark_entries if e["kb_name"] == kb
-                        ),
+                        "num_entries": len(entries_by_kb.get(kb, [])),
                     }
                     for kb in self.kb_names
                 ],
             },
-            "entries_dir": str(entries_dir),
+            "entries_dir": str(run_dir),
             "knowledge_scopes_dir": str(self.scopes_dir),
         }
 
-        summary_file = entries_dir / "_summary.json"
+        summary_file = run_dir / "_summary.json"
         with open(summary_file, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
 
