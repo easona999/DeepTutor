@@ -20,7 +20,6 @@ DeepTutor_arxiv-4/
 *.fls
 *.out
 *.synctex.gz
-*.pdf
 !demo/*.pdf
 
 # ============================================
